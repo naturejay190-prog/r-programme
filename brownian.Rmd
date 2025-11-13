@@ -1,0 +1,171 @@
+title: "SM Analysis with OLS Regression ft. Brownian Motion"
+author: "Josh Rolle"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(yfR)
+library(quantmod)
+library(tidyquant)
+library(ggplot2)
+library(dplyr)
+library(tseries)
+library(lmtest)
+library(xts)
+library(broom)
+library(car)
+library(TTR)
+```
+
+## COLLECT
+
+```{r}
+small_cap_tech <- c("QBTS", "PLTR", "QNTM", "AI", "SMCI")
+large_cap_tech <- c("AAPL", "MSFT", "GOOGL", "AMZN", "META")
+
+#f(x)
+download_stock_data <- function(tickers) {
+  data_list <- lapply(tickers, function(ticker) {
+    stock_data <- yf_get(ticker, first_date = "2020-03-06", last_date = Sys.Date())
+    stock_data$ticker <- ticker
+    return(stock_data)
+  })
+  return(bind_rows(data_list))
+}
+
+# down
+small_cap_data <- download_stock_data(small_cap_tech)
+large_cap_data <- download_stock_data(large_cap_tech)
+
+# merge
+total_data <- bind_rows(small_cap_data, large_cap_data)
+```
+
+## prep data
+
+```{r}
+total_data <- total_data %>%
+  group_by(ticker) %>%
+  mutate(
+    Weekly_Pct_Change = (price_adjusted / lag(price_adjusted, 5)) - 1,
+    Monthly_Volume_Pct_Change = (volume / lag(volume, 21)) - 1,
+    Volatility = rollapply(price_adjusted, width = 21, FUN = sd, fill = NA, align = "right"),
+    D_Weekly_Pct_Change = c(NA, diff(Weekly_Pct_Change, lag = 1)),
+    D_Monthly_Volume_Pct_Change = c(NA, diff(Monthly_Volume_Pct_Change, lag = 1)),
+    D_Volatility = c(NA, diff(Volatility, lag = 1)),
+    D_price_adjusted = c(NA, diff(price_adjusted, lag = 1))
+  ) %>%
+  ungroup()
+```
+
+## Stationarity tests
+
+```{r}
+adf_results <- total_data %>%
+  group_by(ticker) %>%
+  summarize(
+    ADF_D_Price = ifelse(length(na.omit(D_price_adjusted)) > 10 && length(unique(na.omit(D_price_adjusted))) > 1, 
+                         adf.test(na.omit(D_price_adjusted))$p.value, NA),
+    ADF_D_Weekly_Pct_Change = ifelse(length(na.omit(D_Weekly_Pct_Change)) > 10 && length(unique(na.omit(D_Weekly_Pct_Change))) > 1, 
+                                     adf.test(na.omit(D_Weekly_Pct_Change))$p.value, NA),
+    ADF_D_Monthly_Volume_Pct_Change = ifelse(length(na.omit(D_Monthly_Volume_Pct_Change)) > 10 && length(unique(na.omit(D_Monthly_Volume_Pct_Change))) > 1, 
+                                             adf.test(na.omit(D_Monthly_Volume_Pct_Change))$p.value, NA),
+    ADF_D_Volatility = ifelse(length(na.omit(D_Volatility)) > 10 && length(unique(na.omit(D_Volatility))) > 1, 
+                              adf.test(na.omit(D_Volatility))$p.value, NA)
+  )
+
+print(adf_results)
+```
+
+## OLS
+
+```{r}
+ols_model <- lm(D_price_adjusted ~ D_Weekly_Pct_Change + D_Monthly_Volume_Pct_Change + D_Volatility, data = total_data)
+summary(ols_model)
+```
+
+## Simulate Brownian Motion
+
+```{r}
+set.seed(123) 
+n <- nrow(total_data) #to match the length
+
+total_data$BM_price <- cumsum(rnorm(n, mean = 0, sd = sd(total_data$D_price_adjusted, na.rm = TRUE)))
+total_data$D_BM_price <- c(NA, diff(total_data$BM_price))
+
+# OLS Regression on Brownian motion(BM)
+bm_model <- lm(D_BM_price ~ D_Weekly_Pct_Change + D_Monthly_Volume_Pct_Change + D_Volatility, data = total_data)
+summary(bm_model)
+```
+
+## Comparing AM vs BM
+
+```{r}
+real_r2 <- summary(ols_model)$r.squared
+bm_r2 <- summary(bm_model)$r.squared
+
+cat("R-squared for real data model:", real_r2, "\n")
+cat("R-squared for Brownian motion model:", bm_r2, "\n")
+```
+
+## Visualize
+
+```{r}
+# Plots with regression
+ggplot(total_data, aes(x = D_Weekly_Pct_Change, y = D_price_adjusted)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "OLS Regression: Weekly % Change vs Price", x = "D_Weekly_Pct_Change", y = "D_price_adjusted")
+
+###clean
+total_data_clean <- total_data %>%
+  filter(complete.cases(D_Weekly_Pct_Change, D_price_adjusted))  
+
+#length
+length(total_data_clean$D_Weekly_Pct_Change)
+length(total_data_clean$D_price_adjusted)
+
+## plotting
+ggplot(total_data_clean, aes(x = D_Weekly_Pct_Change, y = D_price_adjusted)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "OLS Regression: Weekly % Change vs Price", x = "D_Weekly_Pct_Change", y = "D_price_adjusted")
+
+model_data <- model.frame(ols_model)
+nrow(model_data)
+
+# tdc
+total_data_clean <- total_data[complete.cases(total_data$D_price_adjusted), ]
+
+# predictions using the cleaned data
+real_preds_clean <- predict(ols_model, newdata = total_data_clean)
+
+# checkin lengths
+length(total_data_clean$D_price_adjusted)
+length(real_preds_clean)
+
+plot(total_data_clean$D_price_adjusted, real_preds_clean,
+     main = "Real Model: Actual vs Predicted",
+     xlab = "Actual", ylab = "Predicted", col = "blue")
+abline(0, 1, col = "red")
+
+model_data_bm <- model.frame(bm_model)
+nrow(model_data_bm)
+
+# fitting bm
+total_data_clean_bm <- total_data[complete.cases(total_data$D_BM_price), ]
+
+#predictions
+bm_preds_clean <- predict(bm_model, newdata = total_data_clean_bm)
+
+# check
+length(total_data_clean_bm$D_BM_price)
+length(bm_preds_clean)
+
+plot(total_data_clean_bm$D_BM_price, bm_preds_clean,
+     main = "Brownian Model: Actual vs Predicted",
+     xlab = "Actual", ylab = "Predicted", col = "blue")
+abline(0, 1, col = "red")
+
+```
